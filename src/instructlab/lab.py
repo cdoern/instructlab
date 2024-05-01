@@ -1178,8 +1178,14 @@ def test(data_dir, model_dir, adapter_file):
     is_flag=True,
     help="Whether to skip quantization while converting to GGUF.",
 )
+@click.option(
+    "--skip-unknown",
+    type=bool,
+    default=True,
+    help="Whether to skip unknown tensors",
+)
 @utils.macos_requirement(echo_func=click.secho, exit_exception=click.exceptions.Exit)
-def convert(model_dir, adapter_file, skip_de_quantize, skip_quantize):
+def convert(model_dir, adapter_file, skip_de_quantize, skip_quantize, skip_unknown):
     """Converts model to GGUF"""
     # pylint: disable=C0415
     # Local
@@ -1209,7 +1215,7 @@ def convert(model_dir, adapter_file, skip_de_quantize, skip_quantize):
         hf_path=model_dir_fused, mlx_path=model_dir_fused_pt, local=True, to_pt=True
     )
 
-    convert_llama_to_gguf(model=model_dir_fused_pt, pad_vocab=True)
+    convert_llama_to_gguf(model=model_dir_fused_pt, pad_vocab=True, skip_unknown=skip_unknown)
 
     # quantize 4-bi GGUF (optional)
     if not skip_quantize:
