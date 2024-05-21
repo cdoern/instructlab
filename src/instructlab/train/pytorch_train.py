@@ -4,8 +4,12 @@
 from typing import Optional
 import logging
 import os
+import gc
 
 # Third Party
+from torch.utils.data import Dataset, DataLoader
+import deepspeed as ds
+from deepspeed.ops.adam import FusedAdam
 from datasets import load_dataset
 from peft import LoraConfig
 from tqdm import tqdm
@@ -17,7 +21,10 @@ from transformers import (
     StoppingCriteria,
     StoppingCriteriaList,
     TrainingArguments,
+    get_scheduler,
 )
+from deepspeed.utils.zero_to_fp32 import load_state_dict_from_zero_checkpoint
+from transformers.trainer_pt_utils import AcceleratorConfig
 from trl import DataCollatorForCompletionOnlyLM, SFTTrainer
 import click
 import torch
@@ -59,13 +66,13 @@ class StoppingCriteriaSub(StoppingCriteria):
     def __init__(self, stops=(), encounters=1, *, device: torch.device):
         super().__init__()
         self.device = device
-        self.stops = [stop.to(device) for stop in stops]
+        self.stops = [stop.to(device.type) for stop in stops]
 
     def __call__(
         self, input_ids: torch.LongTensor, scores: torch.FloatTensor, **kwargs
     ) -> bool:
         for seqs in input_ids:
-            seq = seqs[-1].to(self.device)
+            seq = seqs[-1].to(self.device.type)
             for stop in self.stops:
                 if stop == seq:
                     return True
@@ -152,9 +159,12 @@ def pytorch_train(
     model_name: str,
     num_epochs: Optional[int] = None,
     device: torch.device = torch.device("cpu"),
-    four_bit_quant: bool = False,
+    quantize: bool = False,
     dtype: str = "auto",
-    train_style: str = "quick",
+    train_style: str = "full",
+    fsdp: bool = False,
+    deepspeed: bool = False,
+    checkpoint: str = None,
 ):
     """Lab Train for Linux and MacOS"""
     print("PYTORCH_TRAIN.PY: NUM EPOCHS IS: ", num_epochs)
@@ -166,11 +176,16 @@ def pytorch_train(
     print(f"MPS AVAILABLE: {torch.backends.mps.is_available()}")
     print(f"MPS BUILT: {torch.backends.mps.is_built()}")
     if device.type == "cuda":
+        os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'garbage_collection_threshold:0.6,max_split_size_mb:128'
+        os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+        os.environ['BS'] = '20' # not sure what this does
         # estimated by watching nvtop / radeontop during training
-        min_vram = 11 if four_bit_quant else 17
+        min_vram = 11 if quantize else 17
 
         # convert from gibibytes to bytes, torch.cuda.mem_get_info() returns bytes
         min_vram = min_vram * 1024**3
+
+        torch.cuda.empty_cache()
 
         report_cuda_device(device, min_vram)
     elif device.type == "hpu":
@@ -200,7 +215,7 @@ def pytorch_train(
         response_template_ids, tokenizer=tokenizer
     )
 
-    if four_bit_quant:
+    if quantize:
         print("PYTORCH_TRAIN.PY: USING 4-bit quantization with BitsAndBytes")
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -231,7 +246,23 @@ def pytorch_train(
         print(
             f"PYTORCH_TRAIN.PY: MODEL DID NOT HAVE SAME DEVICE AS SPECIFIED. SWITCHING TO: {device}"
         )
-        model = model.to(device)
+        device = torch.device("cuda", 0)
+        name = torch.cuda.get_device_name(device)
+        free, total = torch.cuda.mem_get_info(device)
+        capmin, capmax = torch.cuda.get_device_capability(device)
+        print(
+               f"  {device} is '{name}' ({free} of {total} free, "
+               f"capability: {capmin}.{capmax})"
+        )
+        print(model)
+        try:
+            model = model.to(device)
+            gc.collect()
+            torch.cuda.empty_cache() 
+        except Exception as exc:
+            print(f"Issue when putting model on device: {exc}")
+            print(model)
+            model.to("cpu")
     print(f"PYTORCH_TRAIN.PY: Model device {model.device}")
     if model.device.type == "cuda":
         print(torch.cuda.memory_summary())
@@ -268,7 +299,7 @@ def pytorch_train(
     # MPS seems to be slow on this part. But, if the user is doing CPU or CUDA, this should still happen.
     assistant_old_lst = []
     if device.type != "mps":
-        assistant_old_lst = [
+       assistant_old_lst = [
             model_generate(d["user"]).split(response_template.strip())[-1].strip()
             for d in test_dataset
         ]
@@ -330,8 +361,6 @@ def pytorch_train(
         do_eval = True
         evaluation_strategy = "epoch"
         load_best_model_at_end = True
-    else:
-        raise ValueError(train_style)
     # TODO: This might break MacOS
     fp16 = dtype == "fp16"
     bf16 = not fp16 and device.type != "mps"
@@ -380,14 +409,43 @@ def pytorch_train(
             "generation_config": GaudiGenerationConfig(),
         }
     else:
+        accel_config = None
+        fsdp_config = None
+        deepspeed_config = None
+        gradient_checkpointing = False
+        optim = None
+        adam_beta1 = None
+        adam_beta2 = None
+        learning_rate = None
+        # scheduler = None
+        if deepspeed:
+            # should this be configurable? should user be allowed to give their own?
+            deepspeed_config = "src/instructlab/train/deepspeed_config.json"
+            gradient_checkpointing = True
+            adam_beta1 = 0.9
+            adam_beta2 = 0.95
+            learning_rate = 1
+        if fsdp:
+            accel_config = AcceleratorConfig()
+            fsdp_config = "templated_config.json"
+        else:
+            optim = "adamw_torch"
+            adam_beta1 = 0.9
+            adam_beta2 = 0.999
+            learning_rate = 5e-05
         training_arguments = TrainingArguments(
             output_dir=output_dir,
             num_train_epochs=num_epochs,
-            per_device_train_batch_size=per_device_train_batch_size,
+            per_device_train_batch_size=24,
+            gradient_accumulation_steps=2,
             fp16=fp16,
             save_total_limit=2,
             load_best_model_at_end=load_best_model_at_end,
-            optim="adamw_torch",
+            optim=optim,
+            warmup_steps=3,
+            adam_beta1=adam_beta1,
+            adam_beta2 = adam_beta2,
+            learning_rate = learning_rate,
             evaluation_strategy=evaluation_strategy,
             do_eval=do_eval,
             bf16=bf16,
@@ -396,6 +454,14 @@ def pytorch_train(
             report_to="none",
             torch_compile_backend="aot_eager",
             torch_compile=torch_compile,
+            # this is where DS gets passed in
+            deepspeed=deepspeed_config,
+            # this is weird, causes the train bar to only show two iters
+            gradient_checkpointing=gradient_checkpointing,
+            fsdp=fsdp,
+            fsdp_config=fsdp_config,
+            accelerator_config=accel_config,
+            #resume_from_checkpoint=checkpoint,
             # half_precision_backend = "cpu_amp",
             # use_ipex=True,
             # TODO CPU test this possible optimization
@@ -409,8 +475,49 @@ def pytorch_train(
             # https://stackoverflow.com/a/75793317
         )
 
+        # Do we need these for distributed?
+        # TODO: @ James and @ Oleg I am pretty sure this backend supports distrib systems. It def supports multi GPU.
+        os.environ['MASTER_ADDR'] = 'localhost'
+        os.environ['MASTER_PORT'] = '9994' # modify if RuntimeError: Address already in use
+        os.environ['RANK'] = "0"
+        os.environ['LOCAL_RANK'] = "0"
+        os.environ['WORLD_SIZE'] = "1"
+
+#            model = AutoModelForCausalLM.from_pretrained(
+#                model_name,
+#                torch_dtype=dtype,
+#                quantization_config=None,
+#                config=config,
+#                trust_remote_code=True,
+#                low_cpu_mem_usage=True,
+#            )
+        if deepspeed:
+            training_arguments.optim="adamw_torch_fused"
+        if deepspeed and not quantize:
+            optimizer = FusedAdam(model.parameters(), lr=1, betas=(0.9, 0.95))
+            training_arguments.optim="adamw_torch_fused"
+#            peft_config = None
+            lr_scheduler = get_scheduler(
+                name="cosine",
+                optimizer=optimizer,
+                num_warmup_steps=3,
+                num_training_steps=num_epochs * len(train_dataset),
+            )
+                # DS cannot init a model with the original one of 4BQ.
+                # Unsure if we need this but kinda figured why not 
+                # see what happens :) 
+            model, _, _, lr_scheduler = ds.initialize(
+                    model=model,
+                    optimizer=optimizer,
+                    config="src/instructlab/train/deepspeed_config.json",
+                    lr_scheduler=lr_scheduler,
+                    dist_init_required=True,
+                )
+
+            
         trainer = SFTTrainer(
             model=model,
+            # optimizer=optimizer,
             train_dataset=train_dataset,
             eval_dataset=test_dataset,
             peft_config=peft_config,
@@ -422,8 +529,77 @@ def pytorch_train(
         )
         generate_kwargs = {}
 
+
+    # Ok, now we have a trainer that hopefully has deepspeed set up.
+    # Multi phase? Do I just run training from the best checkpoint 3 times?
+
     print("PYTORCH_TRAIN.PY: TRAINING")
+    
+
     trainer.train()
+    # TODO: below code is if we wanted to let the users train 3 times starting from a checkpoint each time
+    # basically, you need to re init everything (for reasons unknown)
+    # and add resume_from_checkpoint = checkpoint to the training args
+
+    # if train_style == "multi_phase":
+    #     for _ in range(2):
+    #         training_arguments.resume_from_checkpoint = best_checkpoint
+    #         # gc.collect()
+    #         # torch.cuda.empty_cache()
+    #         # trainer.model.unload()
+    #         # 
+    #         # training_arguments = TrainingArguments(
+    #         #     output_dir=output_dir,
+    #         #     num_train_epochs=num_epochs,
+    #         #     per_device_train_batch_size=24,
+    #         #     gradient_accumulation_steps=2,
+    #         #     fp16=fp16,
+    #         #     save_total_limit=2,
+    #         #     load_best_model_at_end=load_best_model_at_end,
+    #         #     optim="adamw_torch_fused",
+    #         #     evaluation_strategy=evaluation_strategy,
+    #         #     do_eval=do_eval,
+    #         #     bf16=bf16,
+    #         #     use_cpu=False,
+    #         #     save_strategy="epoch",
+    #         #     report_to="none",
+    #         #     torch_compile_backend="aot_eager",
+    #         #     torch_compile=torch_compile,
+    #         #     deepspeed=deepspeed_config,
+    #         #     gradient_checkpointing=gradient_checkpointing,
+    #         #     fsdp=fsdp,
+    #         #     fsdp_config=fsdp_config,
+    #         #     accelerator_config=accel_config,
+    #         #     resume_from_checkpoint=best_checkpoint,
+    #         #     # half_precision_backend = "cpu_amp",
+    #         #     # use_ipex=True,
+    #         #     # TODO CPU test this possible optimization
+    #         #     #  gradient_accumulation_steps=4,
+    #         #     #  gradient_checkpointing=True,
+    #         #     # eval_accumulation_steps=1,
+    #         #     # per_device_eval_batch_size=1,
+    #         #     # bf16_full_eval=True,
+    #         #     # options to reduce GPU memory usage and improve performance
+    #         #     # https://huggingface.co/docs/transformers/perf_train_gpu_one
+    #         #     # https://stackoverflow.com/a/75793317
+    #         # )
+    #         #might need new training args
+    # #         trainer = SFTTrainer(
+    # #             model=model,
+    # # #            optimizer=optimizer,
+    # #             train_dataset=train_dataset,
+    # #             eval_dataset=test_dataset,
+    # #             peft_config=peft_config,
+    # #             formatting_func=formatting_prompts_func,
+    # #             data_collator=collator,
+    # #             max_seq_length=max_seq_length,
+    # #             tokenizer=tokenizer,
+    # #             args=training_arguments,
+    # #         )
+    #         trainer.args.num_train_epochs = num_epochs
+    #         #trainer.train(resume_from_checkpoint=best_checkpoint)
+    #         trainer.train()
+    #         best_checkpoint = trainer.state.best_model_checkpoint
 
     model.config.use_cache = True
     print("PYTORCH_TRAIN.PY: RUNNING INFERENCE ON THE OUTPUT MODEL")
@@ -445,7 +621,14 @@ def pytorch_train(
 
     print("PYTORCH_TRAIN.PY: MERGING ADAPTERS")
     print(f"BEST CHECKPOINT TO BE USED: {trainer.state.best_model_checkpoint}")
-    model = trainer.model.merge_and_unload()
-    model.save_pretrained("./training_results/merged_model")
-    print("PYTORCH_TRAIN.PY: FINISHED")
+    if deepspeed and not quantize:
+        checkpoint_dir = os.path.join(trainer.args.output_dir, "checkpoint-final")
+        trainer.deepspeed.save_checkpoint(checkpoint_dir)
+        # TODO: what do I do with fp32_model for ds?
+        fp32_model = load_state_dict_from_zero_checkpoint(trainer.model, checkpoint_dir)
+    else:
+    # TODO: is this only needed if we use lora? is there a scenario here where we DONT want lora?
+        model = trainer.model.merge_and_unload()
+        model.save_pretrained("./training_results/merged_model")
+        print("PYTORCH_TRAIN.PY: FINISHED")
     return trainer.state.best_model_checkpoint

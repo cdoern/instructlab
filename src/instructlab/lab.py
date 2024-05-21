@@ -893,12 +893,28 @@ class TorchDeviceParam(click.ParamType):
 TORCH_DEVICE = TorchDeviceParam()
 
 
-@cli.command()
+@click.group()
+@click.pass_context
+def train(
+    ctx,
+    
+):
+    """
+    Takes synthetic data generated locally with `ilab generate` and the previous model and learns a new model using the MLX API.
+    On success, writes newly learned model to {model_dir}/mlx_model, which is where `chatmlx` will look for a model.
+    """
+
+    pass
+
+# ok so, ilab model train peft.
+# this command will have options for
+# deepspeed+lora single GPU, fsdp+lora single GPU (multi GPU?)
+# running eval inter-checkpoint or not, would this be mmlu or, mt? or would it just use adam?
+    # maybe add options to use MMLU as the checkpoint evaluator.
+
+@train.command
+@click.pass_context
 @click.option("--data-dir", help="Base directory where data is stored.", default=None)
-@click.option(
-    "--skip-preprocessing",
-    is_flag=True,
-)
 @click.option(
     "--input-dir",
     type=click.Path(exists=True, file_okay=False, dir_okay=True),
@@ -911,12 +927,18 @@ TORCH_DEVICE = TorchDeviceParam()
     default="instructlab/merlinite-7b-lab",
     show_default=True,
 )
-@click.option("--iters", help="Number of iterations to train LoRA.", default=100)
+
 @click.option(
-    "-sq",
-    "--skip-quantize",
-    is_flag=True,
-    help="Whether to skip quantization while converting to MLX. This parameter will be ignored if --gguf-model-path and --tokenizer-dir are specified.",
+    "--dtype",
+    type=click.Choice(["bf16", "fp16", "fp32", "auto"]),
+    show_default=True,
+    default="auto",
+    help=("Full half precision training. BF16 is more precise than FP16."),
+)
+@click.option(
+    "--gpus",
+    type=str,
+    default=0,
 )
 @click.option(
     "--num-epochs",
@@ -937,11 +959,10 @@ TORCH_DEVICE = TorchDeviceParam()
     ),
 )
 @click.option(
-    "--4-bit-quant",
-    "four_bit_quant",
+    "--quantize",
     is_flag=True,
     show_default=True,
-    default=False,
+    default=True,
     # TODO: hidden option until llamacpp_convert_to_gguf.py supports
     # quantized models, https://github.com/instructlab/instructlab/issues/579
     hidden=True,
@@ -951,11 +972,14 @@ TORCH_DEVICE = TorchDeviceParam()
     ),
 )
 @click.option(
-    "--dtype",
-    type=click.Choice(["bf16", "fp16", "fp32", "auto"]),
-    show_default=True,
-    default="auto",
-    help=("Full half precision training. BF16 is more precise than FP16."),
+    "--checkpoint",
+    type=click.Path(),
+    # TODO: hidden option until llamacpp_convert_to_gguf.py supports
+    # quantized models, https://github.com/instructlab/instructlab/issues/579
+    hidden=True,
+    help=(
+        "checkpoint to start training from"
+    ),
 )
 @click.option(
     "--backend",
@@ -973,37 +997,42 @@ TORCH_DEVICE = TorchDeviceParam()
         "Run either a quick train without eval or a full train with eval in between each epoch. This allows ilab to choose the best epoch for the final model."
     ),
 )
-@click.pass_context
-def train(
+@click.option("--iters", help="Number of iterations to train LoRA.", default=100)
+@click.option(
+    "-sq",
+    "--skip-quantize",
+    is_flag=True,
+    help="Whether to skip quantization while converting to MLX. This parameter will be ignored if --gguf-model-path and --tokenizer-dir are specified.",
+)
+@click.option(
+    "--accelerator",
+    type=click.Choice(["deepspeed", "fsdp"]),
+    help=(
+        "Accelerator to use for training."
+    ),
+)
+def peft(
     ctx,
     data_dir,
-    skip_preprocessing,
     input_dir,
     model_repo,
-    iters,
-    skip_quantize,
+    dtype,
+    gpus,
     num_epochs,
-    device: "torch.device",
-    four_bit_quant: bool,
-    dtype: str,
+    device,
+    quantize,
+    checkpoint,
     backend,
     train_style,
-):
-    """
-    Takes synthetic data generated locally with `ilab generate` and the previous model and learns a new model using the MLX API.
-    On success, writes newly learned model to {model_dir}/mlx_model, which is where `chatmlx` will look for a model.
-    """
-    # pylint: disable=C0415
-    # Third Party
-    from instructlab_quantize import run_quantize  # pylint: disable=import-error
-
+    iters,
+    skip_quantize,
+    accelerator,
+    ):
     if not input_dir:
         # By default, generate output-dir is used as train input-dir
         input_dir = ctx.obj.config.generate.output_dir
-
-    if four_bit_quant and device.type != "cuda":
-        ctx.fail("--4-bit-quant option requires --device=cuda")
-
+    from .train.pytorch_train import pytorch_train
+    from instructlab_quantize import run_quantize  # pylint: disable=import-error
     # NOTE: If given a data_dir, input-dir is ignored in favor of existing!
     if data_dir is None:
         data_dir = "./taxonomy_data"
@@ -1044,10 +1073,6 @@ def train(
             raise click.exceptions.Exit(1)
 
     if backend == "pytorch":
-        # Local
-        from .llamacpp.llamacpp_convert_to_gguf import convert_llama_to_gguf
-        from .train.pytorch_train import pytorch_train
-
         if device.type == "mps":
             if all("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "PYTORCH_ENABLE_MPS_FALLBACK") not in os.environ:
                 click.secho(
@@ -1055,6 +1080,7 @@ def train(
                     fg="red",
                 )
                 raise click.exceptions.Exit(1)
+
         best_checkpoint = pytorch_train(
             ctx,
             train_file=train_files[0],
@@ -1062,103 +1088,29 @@ def train(
             model_name=model_repo,
             num_epochs=num_epochs,
             device=device,
-            four_bit_quant=four_bit_quant,
+            quantize=quantize,
             dtype=dtype,
             train_style=train_style,
-        )
-
-        training_results_dir = "./training_results"
-        os.makedirs(training_results_dir, exist_ok=True)
-
-        final_results_dir = training_results_dir + "/final"
-        os.makedirs(final_results_dir, exist_ok=True)
-
-        # TODO: Figure out what to do when there are multiple checkpoint dirs.
-        # Right now it's just copying files from the first one numerically not necessarily the best one
-        added_tokens_file = os.path.join(best_checkpoint, "added_tokens.json")
-        special_tokens_map = os.path.join(best_checkpoint, "special_tokens_map.json")
-        tokenizer_json = os.path.join(best_checkpoint, "tokenizer.json")
-        tokenizer_model = os.path.join(best_checkpoint, "tokenizer.model")
-        tokenizer_config_json = os.path.join(best_checkpoint, "tokenizer_config.json")
-        config_json = glob(training_results_dir + "/merged_model/config.json")
-        generation_config_json = glob(
-            training_results_dir + "/merged_model/generation_config.json"
-        )
-        safe_tensors = glob(training_results_dir + "/merged_model/*.safetensors")
-
-        try:
-            shutil.copy(added_tokens_file, final_results_dir)
-            print("Copied ", added_tokens_file, "to ", final_results_dir)
-            shutil.copy(special_tokens_map, final_results_dir)
-            print("Copied ", special_tokens_map, "to ", final_results_dir)
-            shutil.copy(tokenizer_json, final_results_dir)
-            print("Copied ", tokenizer_json, "to ", final_results_dir)
-            shutil.copy(tokenizer_model, final_results_dir)
-            print("Copied ", tokenizer_model[0], "to ", final_results_dir)
-            shutil.copy(tokenizer_config_json, final_results_dir)
-            print("Copied ", tokenizer_config_json, "to ", final_results_dir)
-            shutil.copy(config_json[0], final_results_dir)
-            print("Copied ", config_json[0], "to ", final_results_dir)
-            shutil.copy(generation_config_json[0], final_results_dir)
-            print("Copied ", generation_config_json[0], "to ", final_results_dir)
-        # pylint: disable=W0718
-        except Exception as exc:
-            click.secho(
-                f"Could not copy train files: {exc}",
-                fg="red",
+            fsdp=accelerator=="fsdp",
+            deepspeed=accelerator=="deepspeed",
+            checkpoint=None,
             )
-            return
-        for file in safe_tensors:
-            try:
-                shutil.copy(file, final_results_dir)
-                print("Copied ", file, "to ", final_results_dir)
-            # pylint: disable=W0718
-            except Exception as exc:
-                click.secho(
-                    f"Could not copy train files: {exc}",
-                    fg="red",
-                )
-                return
-
-        if four_bit_quant:
-            print(
-                "SKIPPING CONVERSION to gguf. This is unsupported with --4-bit-quant. "
-                + "See https://github.com/instructlab/instructlab/issues/579."
-            )
-            return
-
-        convert_llama_to_gguf(model=final_results_dir, pad_vocab=True)
-
-        gguf_models_dir = "./models"
-        if not os.path.isdir(gguf_models_dir):
-            os.mkdir(gguf_models_dir)
-        gguf_model = os.path.join(final_results_dir, "ggml-model-f16.gguf")
-        gguf_model_q = "./models/ggml-model-Q4_K_M.gguf"
-        if not skip_quantize:
-            run_quantize(gguf_model, gguf_model_q, "Q4_K_M")
-        else:
-            shutil.copy(final_results_dir + "/ggml-model-f16.gguf", gguf_models_dir)
-        # cleanup original copy of model
-        os.remove(final_results_dir + "/ggml-model-f16.gguf")
-        # cleanup checkpoint dir since it's name is unpredictable
-        # TODO: figure out how checkpoint dirs should be cleaned up
-        checkpoint_dirs = glob(training_results_dir + "/checkpoint*")
-        shutil.rmtree(checkpoint_dirs[0])
+            
+        digest_pytorch(best_checkpoint=best_checkpoint, four_bit_quant=quantize)
     else:
         # Local
         from .train.lora_mlx.convert import convert_between_mlx_and_pytorch
         from .train.lora_mlx.lora import load_and_train
         from .train.lora_mlx.make_data import make_data
 
-        if not skip_preprocessing:
-            try:
-                make_data(data_dir=data_dir)
-            except FileNotFoundError as exc:
-                click.secho(
-                    f"Could not read from data directory: {exc}",
-                    fg="red",
-                )
-                raise click.exceptions.Exit(1)
+        try:
+            make_data(data_dir=data_dir)
+        except FileNotFoundError as exc:
+            click.secho(
+                f"Could not read from data directory: {exc}",
+                fg="red",
+            )
+            raise click.exceptions.Exit(1)
 
         # NOTE we can skip this if we have a way ship MLX
         # PyTorch safetensors to MLX safetensors
@@ -1192,6 +1144,89 @@ def train(
             save_every=10,
             steps_per_eval=10,
         )
+
+
+@train.command
+@click.pass_context
+@click.option("--data-dir", help="Base directory where data is stored.", default=None)
+@click.option(
+    "--skip-preprocessing",
+    is_flag=True,
+)
+@click.option(
+    "--input-dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True),
+    show_default=True,  # TODO: set to None and change help message
+    help="Path to generated files to use as input.",
+)
+@click.option(
+    "--model-repo",
+    help="Base repository where model is stored.",
+    default="instructlab/merlinite-7b-lab",
+    show_default=True,
+)
+@click.option("--iters", help="Number of iterations to train LoRA.", default=100)
+@click.option(
+    "--num-epochs",
+    type=click.INT,
+    default=1,  # TODO: change this to a more reasonable default
+    show_default=True,
+    help="The number of times the training data is passed through the training algorithm. Please note that this value is used on Linux platforms only.",
+)
+@click.option(
+    "--device",
+    type=TORCH_DEVICE,
+    show_default=True,
+    default="cpu",
+    help=(
+        "PyTorch device for Linux training (default: 'cpu'). Use 'cuda' "
+        "for NVidia CUDA / AMD ROCm GPU, 'cuda:0' for first GPU."
+        "Use 'mps' for Apple Silicon hardware."
+    ),
+)
+@click.option(
+    "--dtype",
+    type=click.Choice(["bf16", "fp16", "fp32", "auto"]),
+    show_default=True,
+    default="auto",
+    help=("Full half precision training. BF16 is more precise than FP16."),
+)
+def phased(
+    ctx,
+    data_dir,
+    input_dir,
+    model_repo,
+    iters,
+    skip_quantize,
+    num_epochs,
+    device: "torch.device",
+    dtype: str,
+    ):
+    # will always use torch
+    # should take a dtype option
+    # should take a model repo, input and data dir
+    # epoch and iters?
+    # device for torch
+    print()
+        
+
+    
+
+train.add_command(peft)
+train.add_command(phased)
+cli.add_command(train)
+
+@cli.command()
+@click.option(
+    "--train-dir",
+    type=click.Path(),
+
+)
+def evaluate():
+    print()
+    # somehow run eval on the train dir
+    # tell the user the best checkpoint
+    # they then run train again
 
 
 @cli.command()
@@ -1258,6 +1293,91 @@ def test(data_dir, model_dir, adapter_file):
                 prompt=prompt,
             )
 
+def digest_pytorch(
+    best_checkpoint,
+    four_bit_quant
+        
+):
+        # Local
+        from .llamacpp.llamacpp_convert_to_gguf import convert_llama_to_gguf
+        training_results_dir = "./training_results"
+        os.makedirs(training_results_dir, exist_ok=True)
+
+        final_results_dir = training_results_dir + "/final"
+        os.makedirs(final_results_dir, exist_ok=True)
+
+        # TODO: Figure out what to do when there are multiple checkpoint dirs.
+        # Right now it's just copying files from the first one numerically not necessarily the best one
+        added_tokens_file = os.path.join(best_checkpoint, "added_tokens.json")
+        special_tokens_map = os.path.join(best_checkpoint, "special_tokens_map.json")
+        tokenizer_json = os.path.join(best_checkpoint, "tokenizer.json")
+        tokenizer_model = os.path.join(best_checkpoint, "tokenizer.model")
+        tokenizer_config_json = os.path.join(best_checkpoint, "tokenizer_config.json")
+        config_json = glob(training_results_dir + "/merged_model/config.json")
+        generation_config_json = glob(
+            training_results_dir + "/merged_model/generation_config.json"
+        )
+        safe_tensors = glob(training_results_dir + "/merged_model/*.safetensors")
+
+        try:
+            shutil.copy(added_tokens_file, final_results_dir)
+            print("Copied ", added_tokens_file, "to ", final_results_dir)
+            shutil.copy(special_tokens_map, final_results_dir)
+            print("Copied ", special_tokens_map, "to ", final_results_dir)
+            shutil.copy(tokenizer_json, final_results_dir)
+            print("Copied ", tokenizer_json, "to ", final_results_dir)
+            shutil.copy(tokenizer_model, final_results_dir)
+            print("Copied ", tokenizer_model[0], "to ", final_results_dir)
+            shutil.copy(tokenizer_config_json, final_results_dir)
+            print("Copied ", tokenizer_config_json, "to ", final_results_dir)
+            shutil.copy(config_json[0], final_results_dir)
+            print("Copied ", config_json[0], "to ", final_results_dir)
+            shutil.copy(generation_config_json[0], final_results_dir)
+            print("Copied ", generation_config_json[0], "to ", final_results_dir)
+        # pylint: disable=W0718
+        except Exception as exc:
+            click.secho(
+                f"Could not copy train files: {exc}",
+                fg="red",
+            )
+            return
+        for file in safe_tensors:
+            try:
+                shutil.copy(file, final_results_dir)
+                print("Copied ", file, "to ", final_results_dir)
+            # pylint: disable=W0718
+            except Exception as exc:
+                click.secho(
+                    f"Could not copy train files: {exc}",
+                    fg="red",
+                )
+                return
+
+        if four_bit_quant:
+            print(
+                "SKIPPING CONVERSION to gguf. This is unsupported with --4-bit-quant. "
+                + "See https://github.com/instructlab/instructlab/issues/579."
+            )
+            convert_llama_to_gguf(model=final_results_dir, pad_vocab=True)
+            return
+
+        convert_llama_to_gguf(model=final_results_dir, pad_vocab=True)
+
+        gguf_models_dir = "./models"
+        if not os.path.isdir(gguf_models_dir):
+            os.mkdir(gguf_models_dir)
+        gguf_model = os.path.join(final_results_dir, "ggml-model-f16.gguf")
+        gguf_model_q = "./models/ggml-model-Q4_K_M.gguf"
+        if not skip_quantize:
+            run_quantize(gguf_model, gguf_model_q, "Q4_K_M")
+        else:
+            shutil.copy(final_results_dir + "/ggml-model-f16.gguf", gguf_models_dir)
+        # cleanup original copy of model
+        os.remove(final_results_dir + "/ggml-model-f16.gguf")
+        # cleanup checkpoint dir since it's name is unpredictable
+        # TODO: figure out how checkpoint dirs should be cleaned up
+        checkpoint_dirs = glob(training_results_dir + "/checkpoint*")
+        shutil.rmtree(checkpoint_dirs[0])
 
 @cli.command()
 @click.option(
