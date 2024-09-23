@@ -32,6 +32,7 @@ class SupportedTrainingStrategies(enum.Enum):
     """Available advanced training stratefies"""
 
     LAB_MULTIPHASE: str = "lab-multiphase"
+    LAB_SINGLEPHASE: str = "lab-singlephase"
 
 
 def clickpath_setup(is_dir: bool) -> click.Path:
@@ -285,7 +286,7 @@ def clickpath_setup(is_dir: bool) -> click.Path:
 @click.option(
     "--strategy",
     type=click.Choice(
-        [SupportedTrainingStrategies.LAB_MULTIPHASE.value], case_sensitive=False
+        [SupportedTrainingStrategies.LAB_MULTIPHASE.value, SupportedTrainingStrategies.LAB_SINGLEPHASE.value], case_sensitive=False
     ),
     show_default=True,
     help="If chosen, will run the selected training strategy instead of a single training run.",
@@ -667,6 +668,43 @@ def train(
                 mtbench_judge=mt_bench_judge,
                 enable_serving_output=enable_serving_output,
             )
+        elif strategy == SupportedTrainingStrategies.LAB_SINGLEPHASE.value:
+                _training_phase(
+                    train_args=train_args.model_copy(deep=True),
+                    torch_args=torch_args,
+                    data_path=phased_phase1_data,
+                    checkpoint_dir=phased_base_dir / "phase1" / "checkpoints",
+                    num_epochs=phased_phase1_num_epochs,
+                    samples_per_save=phased_phase1_samples_per_save,
+                    effective_batch_size=phased_phase1_effective_batch_size,
+                    # model override not necessary because we expect model to come from ctx.params.model_path.
+                )
+                if "skills_" in phased_phase1_data:
+                    phase1_checkpoints_dir = phase1_checkpoints_dir / "hf_format"
+                    phase1_eval_cache = phased_base_dir / "phase1" / "eval_cache"
+                    best_score, best_checkpoint = _evaluate_dir_of_checkpoints(
+                        checkpoints_dir=phase1_checkpoints_dir,
+                        eval_func=functools.partial(
+                            _mtbench,
+                            ctx=ctx,
+                            eval_cache=phase1_eval_cache,
+                            mtbench_judge=mt_bench_judge,
+                            enable_serving_output=enable_serving_output,
+                        ),
+                    )                          
+                elif "knowledge_" in phased_phase1_data:
+                    # NOTE: requires hf_format sub-directory. Training sets this up.
+                    phase1_checkpoints_dir = phase1_checkpoints_dir / "hf_format"
+                    best_score, best_checkpoint = _evaluate_dir_of_checkpoints(
+                        checkpoints_dir=phase1_checkpoints_dir, eval_func=_mmlu
+                    )
+                
+                click.secho(
+                    f"Training finished! Best final checkpoint: {best_checkpoint} with score: {best_score}",
+                    fg="green",
+                )
+
+
 
         else:
             if not os.path.isfile(data_path):
