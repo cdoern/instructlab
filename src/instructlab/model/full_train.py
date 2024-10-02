@@ -9,7 +9,7 @@ import os
 # Third Party
 from instructlab_quantize import run_quantize
 from tqdm import tqdm
-from transformers import Adafactor, AutoModelForCausalLM
+from transformers import Adafactor, AutoModelForCausalLM, get_scheduler
 import numpy as np
 import psutil
 
@@ -164,7 +164,15 @@ def train(train_args, device):
 
     # adafactor and gradient checkpointing are memory friendly, we opt to use these in the CPU/MPS loop to fit 7b models.
     optimizer = Adafactor(
-        model.parameters(), lr=1e-5, scale_parameter=True, relative_step=False
+        model.parameters(), lr=1e-4, scale_parameter=False, relative_step=False
+    )
+    num_warmup = 10
+    num_steps = (len(dataloader.dataset) / train_args.effective_batch_size) * train_args.num_epochs
+    scheduler = get_scheduler(
+        "linear",
+        optimizer=optimizer,
+        num_warmup_steps=num_warmup,
+        num_training_steps=num_steps,
     )
     model.gradient_checkpointing_enable()
 
@@ -184,7 +192,7 @@ def train(train_args, device):
     for epoch in range(train_args.num_epochs):
         dataloader.batch_sampler.set_epoch(epoch)
         inner_pb = tqdm(range(len(dataloader)), desc=f"Epoch {epoch}")
-        aggregated_values = torch.zeros(3, dtype=torch.float16).to(dev)
+        aggregated_values = torch.zeros(3, dtype=torch.float32).to(dev)
 
         for step, batch in enumerate(dataloader):
             aggregated_values[0] = batch.pop("num_loss_counted_tokens")
@@ -225,6 +233,7 @@ def train(train_args, device):
             # if we are on a step which is divisible by 4, step and zero gradients
             if (step + 1) % accum == 0:
                 optimizer.step()  # Optimizer step
+                scheduler.step()
                 optimizer.zero_grad()  # Zero gradients
 
                 # Clear cache after optimizer step
