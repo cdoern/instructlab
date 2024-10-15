@@ -5,6 +5,9 @@ from pathlib import Path
 import logging
 import math
 import os
+from mlx.nn import Linear, ReLU
+from mlx.optimizers import Adam
+from mlx.core import array
 
 # Third Party
 from instructlab_quantize import run_quantize
@@ -18,6 +21,23 @@ from instructlab.llamacpp import llamacpp_convert_to_gguf
 
 logger = logging.getLogger(__name__)
 
+import torch 
+
+class MLXModel(torch.nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim):
+        super(MLXModel, self).__init__()
+        self.linear1 = Linear(input_dim, hidden_dim)  # MLX Linear layer
+        self.relu = ReLU()  # MLX ReLU activation
+        self.linear2 = Linear(hidden_dim, output_dim)  # Output layer
+
+    def forward(self, input_ids, attention_mask=None, **kwargs):
+   # Convert input_ids to MLX array if necessary
+        if isinstance(input_ids, torch.Tensor):
+            input_ids = array(input_ids.cpu().numpy())  # Convert torch tensor to MLX array
+        x = self.linear1(input_ids)
+        x = self.relu(x)
+        x = self.linear2(x)
+        return x
 
 def train(train_args, device):
     """
@@ -154,20 +174,29 @@ def train(train_args, device):
     total_ram = memory_info.total / (1024**3)  # Convert to GB
     logger.info(f"Total RAM: {total_ram:.2f} GB")
     # if RAM is <= 16, we need to use fp16 not fp32. This will yield a worse model but will allow the full pipeline to run
-    if total_ram <= 16:
-        # if <= 16GB ram, use gradinent accum and hald precision
-        logger.warning(
-            f"Your system has {total_ram:.2f} GB of RAM. This is below our reccomendation of 32GB for this type of training. Using half precision."
-        )
-        model = model.to(dev).half()  # Convert model to float16
-    else:
+ #   if total_ram <= 16:
+ #       # if <= 16GB ram, use gradinent accum and hald precision
+ #       logger.warning(
+ #           f"Your system has {total_ram:.2f} GB of RAM. This is below our reccomendation of 32GB for this type of training. Using half precision."
+ #       )
+ #       model = model.to(dev).half()  # Convert model to float16
+ #   else:
+    if dev.type == "cpu":
         model = model.to(dev)
+    else:
+        hidden_size = model.config.hidden_size
+        vocab_size = model.config.vocab_size
+        logger.info(f"Model hidden size: {hidden_size}, vocab size: {vocab_size}")
+        model = MLXModel(model.config.hidden_size, model.config.hidden_size, model.config.vocab_size).to(device)
 
     # adafactor and gradient checkpointing are memory friendly, we opt to use these in the CPU/MPS loop to fit 7b models.
-    optimizer = Adafactor(
-        model.parameters(), lr=2e-5, scale_parameter=False, relative_step=False
-    )
-    model.gradient_checkpointing_enable()
+    if dev.type == "cpu":
+        optimizer = Adafactor(
+            model.parameters(), lr=2e-5, scale_parameter=False, relative_step=False
+        )
+    else:
+        optimizer = Adam(learning_rate=2e-5)
+    #model.gradient_checkpointing_enable()
 
     model.train()
 
@@ -202,7 +231,13 @@ def train(train_args, device):
                 else:
                     batch[k] = batch[k].to(device=dev)
 
-            output = model(**batch, use_cache=False)
+            if dev.type == "cpu":
+                output = model(**batch, use_cache=False)
+            else:
+                # Convert to MLX array if necessary
+                input_ids_ml = array(batch["input_ids"].detach().cpu().numpy())
+                attention_mask_ml = array(batch["attention_mask"].detach().cpu().numpy())
+                output = model(input_ids=input_ids_ml, attention_mask=attention_mask_ml, use_cache=False)
             loss = output.loss
             aggregated_values[2] = loss.item()
 
@@ -277,20 +312,15 @@ def pad_collate_fn(batch, pad_token_id):
 
     input_ids = torch.stack(
         [
-            F.pad(
-                item["input_ids"],
-                (max_len - len(item["input_ids"]), 0),
-                mode="constant",
-                value=pad_token_id,
-            )
+            F.pad(torch.tensor(item["input_ids"]), (0, max_len - len(item["input_ids"])), mode="constant", value=pad_token_id)
             for item in batch
         ]
     )
     labels = torch.stack(
         [
             F.pad(
-                item["labels"],
-                (max_len - len(item["labels"]), 0),
+                torch.tensor(item["labels"]),
+                (0, max_len - len(item["labels"])),
                 mode="constant",
                 value=-100,
             )
@@ -302,8 +332,8 @@ def pad_collate_fn(batch, pad_token_id):
     attention_mask = torch.stack(
         [
             F.pad(
-                item["attention_mask"],
-                (max_len - len(item["attention_mask"]), 0),
+                torch.tensor(item["attention_mask"]),
+                (0, max_len - len(item["attention_mask"])),
                 mode="constant",
                 value=0,
             )
@@ -322,3 +352,4 @@ def pad_collate_fn(batch, pad_token_id):
         "num_loss_counted_tokens": num_loss_counted_tokens,
         "attention_mask": attention_mask,
     }
+
