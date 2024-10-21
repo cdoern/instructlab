@@ -147,6 +147,12 @@ logger = logging.getLogger(__name__)
     cls=clickext.ConfigOption,
     config_sections="teacher.vllm",
 )
+@click.option(
+    "--num-servers",
+    type=click.INT,
+    cls=clickext.ConfigOption,
+
+)
 @click.pass_context
 @clickext.display_params
 def generate(
@@ -173,6 +179,7 @@ def generate(
     enable_serving_output,
     batch_size,
     gpus,
+    num_servers
 ):
     """Generates synthetic data to enhance your example data"""
 
@@ -249,6 +256,7 @@ def generate(
             batch_size,
             gpus,
             checkpoint_dir,
+            num_servers
         )
     except Exception as exc:
         click.secho(f"failed to generate data with exception: {exc}", fg="red")

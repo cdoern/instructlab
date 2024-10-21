@@ -244,6 +244,10 @@ class _generate(BaseModel):
         default=DEFAULTS.SDG_PIPELINE,
         description="Data generation pipeline to use. Available: 'simple', 'full', or a valid path to a directory of pipeline workflow YAML files. Note that 'full' requires a larger teacher model, Mixtral-8x7b.",
     )
+    num_servers: Optional[int] = Field(
+        default=2,
+        description="Amount of llama-cpp servers to start during generation. llama-cpp does not support paralell completions. Creating 2 or 3 instances doesn't significantly increase the memory footprint but allows us to mimic paralell processes."
+    )
     model: StrictStr = Field(
         default_factory=lambda: DEFAULTS.DEFAULT_TEACHER_MODEL,
         description="Teacher model that will be used to synthetically generate training data.",
