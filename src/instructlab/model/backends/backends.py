@@ -110,6 +110,7 @@ def select_backend(
     backend: Optional[str] = None,
     model_path: pathlib.Path | None = None,
     log_file: pathlib.Path | None = None,
+    num_threads: int = 1
 ) -> BackendServer:
     # Local
     from .llama_cpp import Server as llama_cpp_server
@@ -138,7 +139,7 @@ def select_backend(
             chat_template=chat_template,
             gpu_layers=cfg.llama_cpp.gpu_layers,
             max_ctx_size=cfg.llama_cpp.max_ctx_size,
-            num_threads=None,  # exists only as a flag not a config
+            num_threads=num_threads,  # exists only as a flag not a config
             model_family=cfg.llama_cpp.llm_family,
             host=host,
             port=port,

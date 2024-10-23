@@ -178,7 +178,7 @@ def server(
     gpu_layers: int,
     max_ctx_size: int,
     model_family: str,
-    threads=None,
+    threads: int = 1,
     host: str = "localhost",
     port: int = 8000,
     queue: Optional[multiprocessing.Queue] = None,

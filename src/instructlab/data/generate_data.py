@@ -56,7 +56,7 @@ def gen_data(
             serve_cfg.llama_cpp.llm_family = "mixtral"
             try: 
                 log.add_file_handler_to_logger(logger, f"{base_port-i}.txt")
-                backend_instance = backends.select_backend(cfg=serve_cfg, model_path=model_path, log_file=f"{base_port-i}.txt")
+                backend_instance = backends.select_backend(cfg=serve_cfg, model_path=model_path, log_file=f"{base_port-i}.txt", num_threads=2)
 
             except Exception as exc:
                 print(exc)
@@ -100,24 +100,12 @@ def gen_data(
                     "Disabling SDG batching - unsupported with llama.cpp serving"
                 )
             batch_size = 0
-
-    clients = []
-
-    for base in api_base_list:
-        try:
-            c = openai.OpenAI(
-                base_url=base, api_key=api_key, http_client=http_client(http_client_params)
-            )
-            clients.append(c)
-        except Exception as exc:
-            raise exc
-
     try:
         logger.info(
             f"Generating synthetic data using '{pipeline}' pipeline, '{model_path}' model, '{taxonomy_path}' taxonomy"
         )
         generate_data(
-            clients=clients,
+            clients=api_base_list,
             model_family=model_family,
             model_name=model_path,
             num_cpus=num_cpus,
