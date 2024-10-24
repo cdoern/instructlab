@@ -4,11 +4,14 @@ import logging
 # Third Party
 from instructlab.sdg.generate_data import generate_data
 
+from concurrent.futures import ProcessPoolExecutor
+
 # pylint: disable=ungrouped-imports
 from instructlab.sdg.utils import GenerateException
 import openai
 from instructlab import log
 
+import os
 
 # First Party
 from instructlab.utils import HttpClientParams, http_client
@@ -51,61 +54,93 @@ def gen_data(
 
         backend_instances = []
         base_port = 8000
-        for i in range(num_servers):
-            serve_cfg.host_port = f"127.0.0.1:{base_port-i}"
-            serve_cfg.llama_cpp.llm_family = "mixtral"
-            try: 
-                log.add_file_handler_to_logger(logger, f"{base_port-i}.txt")
-                backend_instance = backends.select_backend(cfg=serve_cfg, model_path=model_path, log_file=f"{base_port-i}.txt", num_threads=2)
-
-            except Exception as exc:
-                print(exc)
-                raise exc
-            if (
-                backend_instance.get_backend_type() is not backends.VLLM
-                and gpus is not None
-            ):
-                logger.debug(
-                    "Cannot specify '--gpus' with a llama-cpp backend, ignoring this flag."
+        with ProcessPoolExecutor() as executor:
+            futures = [
+                executor.submit(
+                prepare_for_and_generate_data,
+                pipeline,
+                serve_cfg,
+                http_client_params,
+                model_family,
+                model_path,
+                num_cpus,
+                sdg_scale_factor,
+                taxonomy_path,
+                taxonomy_base,
+                output_dir,
+                quiet,
+                yaml_rules,
+                chunk_word_count,
+                server_ctx_size,
+                batch_size,
+                checkpoint_dir,
+                thread,
+                num_servers,
                 )
-            if backend_instance.get_backend_type() is not backends.LLAMA_CPP and num_servers > 1:
-                logger.debug(
-                    "Cannot specify '--num-servers' with vLLM backend. Ignoring this flag"
-                )
-                num_servers = 1
-            backend_instances.append(backend_instance)
+                for thread in range(num_servers)
+            ]
+            for i, future in enumerate(futures):
+                if future.running():
+                    logger.debug(f"Thread {i} is running")
+                elif future.done():
+                    logger.debug(f"Thread {i} has completed")
+                elif future.cancelled():
+                    logger.debug(f"Thread {i} was canceled")
+            for future in futures:
+                ds = future.result()
+                print(ds)
+ 
 
-        try:
-            # Run the backend server
-            api_base_list = []
-            for backend_instance in backend_instances:
-                try:
-                    base = backend_instance.run_detached(
-                        http_client=http_client(http_client_params),
-                      #  background=not enable_serving_output,
-                      #  foreground_allowed=True,
-                      #  max_startup_retries=1,
-                    )
-                    api_base_list.append(base)
-                except Exception as exc:
-                    print(exc)
-                    raise exc
-        except Exception as exc:
-            raise ValueError(f"Failed to start server: {exc}") from exc
+def prepare_for_and_generate_data(
+        pipeline,
+        serve_cfg,
+        http_client_params,
+        model_family,
+        model_path,
+        num_cpus,
+        sdg_scale_factor,
+        taxonomy_path,
+        taxonomy_base,
+        output_dir,
+        quiet,
+        yaml_rules,
+        chunk_word_count,
+        server_ctx_size,
+        batch_size,
+        checkpoint_dir,
+        thread,
+        total_threads,
 
+):
+    from instructlab.model.backends import backends
+    from instructlab.model.backends.llama_cpp import Server as llama_cpp_server
+
+    os.sched_setaffinity(0, {thread % os.cpu_count()})
+    serve_cfg.host_port = f"127.0.0.1:{8000-thread}"
+    log.add_file_handler_to_logger(logger, f"{8000-thread}.txt")
+    backend_instance = backends.select_backend(cfg=serve_cfg, model_path=model_path, log_file=f"{8000-thread}.txt", num_threads=4)
+    try:
+        logger.info(
+            f"Generating synthetic data using '{pipeline}' pipeline, '{model_path}' model, '{taxonomy_path}' taxonomy"
+        )
+        base = backend_instance.run_detached(
+            http_client=http_client(http_client_params),
+            background=False,
+            foreground_allowed=True,
+            max_startup_retries=1,
+        )
+        c = openai.OpenAI(
+                base_url=base, api_key='no_api_key',  http_client=http_client(http_client_params)
+        )
         # disable batching when running with the local llama.cpp server
-        if isinstance(backend_instances[0], llama_cpp_server):
+        if isinstance(backend_instance, llama_cpp_server):
             if batch_size is not None:
                 logger.warning(
                     "Disabling SDG batching - unsupported with llama.cpp serving"
                 )
             batch_size = 0
-    try:
-        logger.info(
-            f"Generating synthetic data using '{pipeline}' pipeline, '{model_path}' model, '{taxonomy_path}' taxonomy"
-        )
         generate_data(
-            clients=api_base_list,
+            client=c,
             model_family=model_family,
             model_name=model_path,
             num_cpus=num_cpus,
@@ -120,17 +155,17 @@ def gen_data(
             pipeline=pipeline,
             batch_size=batch_size,
             checkpoint_dir=checkpoint_dir,
+            thread=thread,
+            total_threads=total_threads,
         )
     except KeyboardInterrupt as keyb:
-        logger.info("Detected Keyboard Interrupt, shutting down all servers")
-        if backend_instances is not None:
-            for backend_instance in backend_instances:
-                backend_instance.shutdown()
+        logger.info(f"Detected Keyboard Interrupt, shutting down all servers {keyb}")
+        if backend_instance is not None:
+            backend_instance.shutdown()
     except GenerateException as exc:
         raise ValueError(
             f"Generating dataset failed with the following error: {exc}"
         ) from exc
     finally:
-        if backend_instances is not None:
-            for backend_instance in backend_instances:
-                backend_instance.shutdown()
+        if backend_instance is not None:
+            backend_instance.shutdown()
