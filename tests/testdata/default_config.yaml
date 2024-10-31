@@ -133,7 +133,7 @@ generate:
     # Default: None
     # Examples:
     #   - vllm
-    #   - llama-cpp
+    #   - llama_cpp
     backend:
     # Chat template to supply to the model. Possible values: 'auto'(default),
     # 'tokenizer', a path to a jinja2 file.
@@ -190,7 +190,7 @@ serve:
   # Default: None
   # Examples:
   #   - vllm
-  #   - llama-cpp
+  #   - llama_cpp
   backend:
   # Chat template to supply to the model. Possible values: 'auto'(default),
   # 'tokenizer', a path to a jinja2 file.

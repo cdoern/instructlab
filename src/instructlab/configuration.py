@@ -226,8 +226,8 @@ class _serve(BaseModel):
     backend: Optional[str] = Field(
         default=None,
         description="Serving backend to use to host the model.",
-        examples=["vllm", "llama-cpp"],
-        pattern="vllm|llama-cpp",
+        examples=["vllm", "llama_cpp"],
+        pattern="vllm|llama_cpp",
     )
 
     def api_base(self):
