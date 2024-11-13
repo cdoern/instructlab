@@ -120,6 +120,7 @@ def train(train_args, device, optimize_memory):
         config=config,
         trust_remote_code=True,
         low_cpu_mem_usage=True,
+        device_map="auto",
     )
     if len(tokenizer) > model.config.vocab_size:
         logger.warning(
