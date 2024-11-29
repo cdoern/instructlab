@@ -6,6 +6,7 @@ from typing import Callable
 import json
 import logging
 import os
+import signal
 import subprocess
 import sys
 import time
@@ -185,6 +186,8 @@ def add_process(
                 # Restore the original stdout and stderr after the function completes
                 sys.stdout = sys.__stdout__
                 sys.stderr = sys.__stderr__
+                process_registry.pop(local_uuid, None)
+                save_registry(process_registry=process_registry)
 
 
 def list_processes():
@@ -216,3 +219,92 @@ def list_processes():
         )
 
     return list_of_processes
+
+
+def attach_process(local_uuid: str):
+    """
+    Attach to a running process and display its output in real-time.
+
+    Args:
+        local_uuid (str): UUID of the process to attach to
+    """
+    process_registry = load_registry()
+    if local_uuid not in process_registry:
+        logger.warning("Process not found.")
+        return
+
+    process_info = process_registry[local_uuid]
+    log_file = process_info["log_file"]
+
+    if not os.path.exists(log_file):
+        logger.warning(
+            "Log file not found. The process may not have started logging yet."
+        )
+        return
+
+    logger.info(f"Attaching to process {local_uuid}. Press Ctrl+C to detach and kill.")
+    all_pids = [process_info["pid"]] + process_info["children_pids"]
+    if not all_processes_running(all_pids):
+        return
+    try:
+        with open(log_file, "a+") as log:
+            log.seek(0, os.SEEK_END)  # Move to the end of the log file
+            while all_processes_running(all_pids):
+                line = log.readline()
+                # Check for non-empty and non-whitespace-only lines
+                if line.strip():
+                    print(line.strip())
+                else:
+                    time.sleep(0.1)  # Wait briefly before trying again
+    except KeyboardInterrupt:
+        logger.info("\nDetaching from and killing process.")
+    finally:
+        stop_process(local_uuid=local_uuid)
+
+
+def all_processes_running(pids: list[int]) -> bool:
+    """
+    Returns if a process and all of its children are still running
+    Args:
+        pids (list): a list of all PIDs to check
+    """
+    return all(psutil.pid_exists(pid) for pid in pids)
+
+
+def stop_process(local_uuid):
+    """
+    Stop a running process.
+
+    Args:
+        local_uuid (str): uuid of the process to stop.
+    """
+    process_registry = load_registry()
+    # we should kill the parent process, and also children processes.
+    pid = process_registry[local_uuid]["pid"]
+    children_pids = process_registry[local_uuid]["children_pids"]
+    all_processes = [pid] + children_pids
+    for process in all_processes:
+        try:
+            os.kill(process, signal.SIGKILL)
+            logger.info(f"Process {process} terminated.")
+        except ProcessLookupError:
+            logger.warning(f"Process {process} was not running.")
+    process_registry.pop(local_uuid, None)
+    save_registry(process_registry=process_registry)
+
+
+def get_latest_process() -> str | None:
+    """
+    Returns the last process added to the registry to quickly allow users to attach to it.
+
+    Returns:
+        last_key (str): a string UUID to attach to
+    """
+    process_registry = load_registry()
+    keys = process_registry.keys()
+    # no processes
+    if len(keys) == 0:
+        return None
+    last_key = list(process_registry.keys())[-1]
+    assert isinstance(last_key, str)
+    return last_key
