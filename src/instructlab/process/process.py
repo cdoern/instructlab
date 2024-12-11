@@ -115,6 +115,7 @@ def add_process(
     pid = os.getpid()
     children_pids = []
     start_time_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    kwargs["log_file"] = log_file
     if process_mode == ILAB_PROCESS_MODES.DETACHED:
         # Prepare the subprocess command string
         cmd = f"import {target.__module__}; {target.__module__}.{target.__name__}(**{kwargs})"

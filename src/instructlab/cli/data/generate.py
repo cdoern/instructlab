@@ -292,6 +292,7 @@ def generate(
             system_prompt,
             legacy_pretraining_format,
             process_mode=process_mode,
+            log_level=ctx.obj.config.general.log_level,
         )
     except Exception as exc:
         click.secho(f"failed to generate data with exception: {exc}", fg="red")
